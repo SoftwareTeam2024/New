@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using LiveSplit.Options;
 #pragma warning disable 1591
 
 // Note: Please be careful when modifying this because it could break existing components!
@@ -41,7 +42,7 @@ namespace LiveSplit.ComponentUtil
 
     public static class ExtensionMethods
     {
-        private static Dictionary<int, ProcessModuleWow64Safe[]> ModuleCache = new Dictionary<int, ProcessModuleWow64Safe[]>();
+        private static Dictionary<string, ProcessModuleWow64Safe[]> ModuleCache = new Dictionary<string, ProcessModuleWow64Safe[]>();
 
         public static ProcessModuleWow64Safe MainModuleWow64Safe(this Process p)
         {
@@ -64,42 +65,68 @@ namespace LiveSplit.ComponentUtil
             if (!WinAPI.EnumProcessModulesEx(p.Handle, hModules, cb, out cbNeeded, LIST_MODULES_ALL))
                 throw new Win32Exception();
             uint numMods = cbNeeded / (uint)IntPtr.Size;
-
-            int hash = p.StartTime.GetHashCode() + p.Id + (int)numMods;
-            if (ModuleCache.ContainsKey(hash))
-                return ModuleCache[hash];
-
-            var ret = new List<ProcessModuleWow64Safe>();
-
-            // everything below is fairly expensive, which is why we cache!
-            var sb = new StringBuilder(MAX_PATH);
-            for (int i = 0; i < numMods; i++)
+            
+            // Create MD5 hash of loaded module pointers, if modules have changed we do the full scan
+            System.Security.Cryptography.MD5 md5 = System.Security.Cryptography.MD5.Create();
+            byte[] hashData = new byte[hModules.Count() * sizeof(Int64)];
+            for(int i = 0; i < numMods; i++)
             {
-                sb.Clear();
-                if (WinAPI.GetModuleFileNameEx(p.Handle, hModules[i], sb, (uint)sb.Capacity) == 0)
-                    throw new Win32Exception();
-                string fileName = sb.ToString();
-
-                sb.Clear();
-                if (WinAPI.GetModuleBaseName(p.Handle, hModules[i], sb, (uint)sb.Capacity) == 0)
-                    throw new Win32Exception();
-                string baseName = sb.ToString();
-
-                var moduleInfo = new WinAPI.MODULEINFO();
-                if (!WinAPI.GetModuleInformation(p.Handle, hModules[i], out moduleInfo, (uint)Marshal.SizeOf(moduleInfo)))
-                    throw new Win32Exception();
-
-                ret.Add(new ProcessModuleWow64Safe()
-                {
-                    FileName = fileName,
-                    BaseAddress = moduleInfo.lpBaseOfDll,
-                    ModuleMemorySize = (int)moduleInfo.SizeOfImage,
-                    EntryPointAddress = moduleInfo.EntryPoint,
-                    ModuleName = baseName
-                });
+                byte[] addrBytes = BitConverter.GetBytes(hModules[i].ToInt64());
+                addrBytes.CopyTo(hashData, i * sizeof(Int64));
             }
 
-            ModuleCache.Add(hash, ret.ToArray());
+            byte[] hashResult = md5.ComputeHash(hashData);
+            string hashString = BitConverter.ToString(hashResult).Replace("-", string.Empty).ToLower();
+
+            if (ModuleCache.ContainsKey(hashString))
+                return ModuleCache[hashString];
+
+            // everything below is fairly expensive, which is why we cache!
+            var ret = new List<ProcessModuleWow64Safe>();
+            var sb = new StringBuilder(MAX_PATH);
+            bool moduleLoadError = false;
+            for (int i = 0; i < numMods; i++)
+            {
+                try
+                {
+                    sb.Clear();
+                    if (WinAPI.GetModuleFileNameEx(p.Handle, hModules[i], sb, (uint)sb.Capacity) == 0)
+                        throw new Win32Exception();
+                    string fileName = sb.ToString();
+
+                    sb.Clear();
+                    if (WinAPI.GetModuleBaseName(p.Handle, hModules[i], sb, (uint)sb.Capacity) == 0)
+                        throw new Win32Exception();
+                    string baseName = sb.ToString();
+
+                    var moduleInfo = new WinAPI.MODULEINFO();
+                    if (!WinAPI.GetModuleInformation(p.Handle, hModules[i], out moduleInfo, (uint)Marshal.SizeOf(moduleInfo)))
+                        throw new Win32Exception();
+
+                    ret.Add(new ProcessModuleWow64Safe()
+                    {
+                        FileName = fileName,
+                        BaseAddress = moduleInfo.lpBaseOfDll,
+                        ModuleMemorySize = (int)moduleInfo.SizeOfImage,
+                        EntryPointAddress = moduleInfo.EntryPoint,
+                        ModuleName = baseName
+                    });
+                }
+                catch(Win32Exception win32Ex)
+                {
+                    // This exception doesnt need to be propagated up since it is a common occurence for
+                    // handles to be invalidated inbetween calls to module functions. If we miss a module
+                    // then we'll get it on the next invocation.
+                    Log.Error(win32Ex);
+                    moduleLoadError = true;
+                    break; 
+                }
+            }
+
+            if (!moduleLoadError)
+            {
+                ModuleCache.Add(hashString, ret.ToArray());
+            }
 
             return ret.ToArray();
         }
